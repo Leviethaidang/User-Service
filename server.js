@@ -126,6 +126,12 @@ app.post('/api/auth/confirm-register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
+    if (!email || !password) {
+        return res.status(400).json({
+            error: "Vui lòng nhập email và password"
+        });
+    }
+    
     const params = {
         AuthFlow: 'USER_PASSWORD_AUTH',
         ClientId: process.env.COGNITO_APP_CLIENT_ID,
