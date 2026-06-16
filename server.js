@@ -790,6 +790,12 @@ app.put('/api/admin/users/:userId', authMiddleware, adminMiddleware, async (req,
         const nextStatus =
             status !== undefined ? status.trim() : currentUser.status;
 
+        if (!["ACTIVE", "DISABLED"].includes(nextStatus)) {
+            return res.status(400).json({
+                error: "Status không hợp lệ. Chỉ chấp nhận ACTIVE hoặc DISABLED"
+            });
+        }
+
         if (!nextFullName) {
             return res.status(400).json({
                 error: "Họ và tên không được để trống"
@@ -829,6 +835,25 @@ app.put('/api/admin/users/:userId', authMiddleware, adminMiddleware, async (req,
             Username: cognitoUsername,
             UserAttributes: cognitoAttributes
         }).promise();
+        
+        if (nextStatus === "DISABLED") {
+            await cognito.adminDisableUser({
+                UserPoolId: process.env.COGNITO_USER_POOL_ID,
+                Username: cognitoUsername
+            }).promise();
+
+            await cognito.adminUserGlobalSignOut({
+                UserPoolId: process.env.COGNITO_USER_POOL_ID,
+                Username: cognitoUsername
+            }).promise();
+        }
+
+        if (nextStatus === "ACTIVE") {
+            await cognito.adminEnableUser({
+                UserPoolId: process.env.COGNITO_USER_POOL_ID,
+                Username: cognitoUsername
+            }).promise();
+        }
 
         if (groupName !== undefined) {
             await removeUserFromGroup(cognitoUsername, "Admin");
