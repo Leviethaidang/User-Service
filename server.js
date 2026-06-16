@@ -57,6 +57,7 @@ async function authMiddleware(req, res, next) {
         req.user = {
             sub: payload.sub,
             username: payload.username || payload["cognito:username"] || payload.sub,
+            groups: payload["cognito:groups"] || [],
             accessToken: token,
             payload
         };
@@ -73,6 +74,41 @@ async function authMiddleware(req, res, next) {
 function getAttributeValue(attributes, name) {
     const found = attributes.find(attr => attr.Name === name);
     return found ? found.Value : null;
+}
+// Middleware kiểm tra quyền Admin
+function adminMiddleware(req, res, next) {
+    const groups = req.user.groups || [];
+
+    if (!groups.includes("Admin")) {
+        return res.status(403).json({
+            error: "Bạn không có quyền Admin!"
+        });
+    }
+
+    next();
+}
+function isValidGroup(groupName) {
+    return ["Admin", "Customer"].includes(groupName);
+}
+
+async function addUserToGroup(username, groupName) {
+    if (!groupName) return;
+
+    await cognito.adminAddUserToGroup({
+        UserPoolId: process.env.COGNITO_USER_POOL_ID,
+        Username: username,
+        GroupName: groupName
+    }).promise();
+}
+
+async function removeUserFromGroup(username, groupName) {
+    if (!groupName) return;
+
+    await cognito.adminRemoveUserFromGroup({
+        UserPoolId: process.env.COGNITO_USER_POOL_ID,
+        Username: username,
+        GroupName: groupName
+    }).promise();
 }
 
 // ==========================================
@@ -530,6 +566,403 @@ app.post('/api/user/profile/verify-email', authMiddleware, async (req, res) => {
     }
 });
 
+// ==========================================
+// ADMIN ROUTE 1: LẤY DANH SÁCH USERS
+// ==========================================
+app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT
+                user_id,
+                full_name,
+                email,
+                phone_number,
+                default_shipping_address,
+                status,
+                created_at,
+                updated_at
+            FROM users
+            ORDER BY created_at DESC
+            `
+        );
+
+        return res.json({
+            message: "Lấy danh sách users thành công!",
+            users: rows
+        });
+
+    } catch (error) {
+        console.error("Lỗi lấy danh sách users:", error);
+        return res.status(500).json({
+            error: "Không thể lấy danh sách users!"
+        });
+    }
+});
+// ==========================================
+// ADMIN ROUTE 2: TẠO USER MỚI
+// ==========================================
+app.post('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
+    const {
+        fullName,
+        email,
+        phoneNumber,
+        password,
+        defaultShippingAddress,
+        groupName = "Customer"
+    } = req.body || {};
+
+    if (!fullName || !email || !phoneNumber || !password) {
+        return res.status(400).json({
+            error: "Vui lòng nhập đầy đủ fullName, email, phoneNumber, password"
+        });
+    }
+
+    if (!isValidEmail(email)) {
+        return res.status(400).json({
+            error: "Email không hợp lệ"
+        });
+    }
+
+    if (!phoneNumber.startsWith("+")) {
+        return res.status(400).json({
+            error: "Số điện thoại cần dùng định dạng quốc tế, ví dụ +84901234567"
+        });
+    }
+
+    if (!isValidGroup(groupName)) {
+        return res.status(400).json({
+            error: "Group không hợp lệ. Chỉ chấp nhận Admin hoặc Customer"
+        });
+    }
+
+    let createdCognitoUser = false;
+
+    try {
+        const createResult = await cognito.adminCreateUser({
+            UserPoolId: process.env.COGNITO_USER_POOL_ID,
+            Username: email,
+            MessageAction: "SUPPRESS",
+            UserAttributes: [
+                { Name: "email", Value: email },
+                { Name: "email_verified", Value: "true" },
+                { Name: "name", Value: fullName },
+                { Name: "phone_number", Value: phoneNumber },
+                { Name: "phone_number_verified", Value: "true" }
+            ]
+        }).promise();
+
+        createdCognitoUser = true;
+
+        await cognito.adminSetUserPassword({
+            UserPoolId: process.env.COGNITO_USER_POOL_ID,
+            Username: email,
+            Password: password,
+            Permanent: true
+        }).promise();
+
+        await addUserToGroup(email, groupName);
+
+        const cognitoSubAttr = createResult.User.Attributes.find(attr => attr.Name === "sub");
+        const userId = cognitoSubAttr.Value;
+
+        await dbPool.execute(
+            `
+            INSERT INTO users (
+                user_id,
+                full_name,
+                email,
+                phone_number,
+                default_shipping_address,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+            `,
+            [
+                userId,
+                fullName.trim(),
+                email.trim(),
+                phoneNumber.trim(),
+                defaultShippingAddress ? defaultShippingAddress.trim() : null
+            ]
+        );
+
+        return res.status(201).json({
+            message: "Admin đã tạo user thành công!",
+            user: {
+                user_id: userId,
+                full_name: fullName,
+                email,
+                phone_number: phoneNumber,
+                default_shipping_address: defaultShippingAddress || null,
+                groupName
+            }
+        });
+
+    } catch (error) {
+        console.error("Lỗi admin tạo user:", error);
+
+        if (createdCognitoUser) {
+            try {
+                await cognito.adminDeleteUser({
+                    UserPoolId: process.env.COGNITO_USER_POOL_ID,
+                    Username: email
+                }).promise();
+            } catch (cleanupError) {
+                console.error("Lỗi cleanup Cognito user:", cleanupError);
+            }
+        }
+
+        if (error.code === "UsernameExistsException") {
+            return res.status(400).json({
+                error: "User này đã tồn tại trong Cognito!"
+            });
+        }
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Email này đã tồn tại trong database!"
+            });
+        }
+
+        return res.status(500).json({
+            error: error.message || "Không thể tạo user!"
+        });
+    }
+});
+// ==========================================
+// ADMIN ROUTE 3: SỬA USER
+// ==========================================
+app.put('/api/admin/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+    const { userId } = req.params;
+
+    const {
+        fullName,
+        email,
+        phoneNumber,
+        defaultShippingAddress,
+        status,
+        groupName
+    } = req.body || {};
+
+    let connection;
+
+    try {
+        connection = await dbPool.getConnection();
+
+        const [rows] = await connection.execute(
+            `
+            SELECT
+                user_id,
+                full_name,
+                email,
+                phone_number,
+                default_shipping_address,
+                status
+            FROM users
+            WHERE user_id = ?
+            `,
+            [userId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy user cần sửa!"
+            });
+        }
+
+        const currentUser = rows[0];
+
+        const nextFullName =
+            fullName !== undefined ? fullName.trim() : currentUser.full_name;
+
+        const nextEmail =
+            email !== undefined ? email.trim() : currentUser.email;
+
+        const nextPhoneNumber =
+            phoneNumber !== undefined ? phoneNumber.trim() : currentUser.phone_number;
+
+        const nextAddress =
+            defaultShippingAddress !== undefined
+                ? defaultShippingAddress.trim()
+                : currentUser.default_shipping_address;
+
+        const nextStatus =
+            status !== undefined ? status.trim() : currentUser.status;
+
+        if (!nextFullName) {
+            return res.status(400).json({
+                error: "Họ và tên không được để trống"
+            });
+        }
+
+        if (!nextEmail || !isValidEmail(nextEmail)) {
+            return res.status(400).json({
+                error: "Email không hợp lệ"
+            });
+        }
+
+        if (!nextPhoneNumber || !nextPhoneNumber.startsWith("+")) {
+            return res.status(400).json({
+                error: "Số điện thoại cần dùng định dạng quốc tế, ví dụ +84901234567"
+            });
+        }
+
+        if (groupName !== undefined && !isValidGroup(groupName)) {
+            return res.status(400).json({
+                error: "Group không hợp lệ. Chỉ chấp nhận Admin hoặc Customer"
+            });
+        }
+
+        const cognitoUsername = currentUser.email;
+
+        const cognitoAttributes = [
+            { Name: "name", Value: nextFullName },
+            { Name: "email", Value: nextEmail },
+            { Name: "email_verified", Value: "true" },
+            { Name: "phone_number", Value: nextPhoneNumber },
+            { Name: "phone_number_verified", Value: "true" }
+        ];
+
+        await cognito.adminUpdateUserAttributes({
+            UserPoolId: process.env.COGNITO_USER_POOL_ID,
+            Username: cognitoUsername,
+            UserAttributes: cognitoAttributes
+        }).promise();
+
+        if (groupName !== undefined) {
+            await removeUserFromGroup(cognitoUsername, "Admin");
+            await removeUserFromGroup(cognitoUsername, "Customer");
+            await addUserToGroup(cognitoUsername, groupName);
+        }
+
+        await connection.execute(
+            `
+            UPDATE users
+            SET
+                full_name = ?,
+                email = ?,
+                phone_number = ?,
+                default_shipping_address = ?,
+                status = ?
+            WHERE user_id = ?
+            `,
+            [
+                nextFullName,
+                nextEmail,
+                nextPhoneNumber,
+                nextAddress || null,
+                nextStatus || "ACTIVE",
+                userId
+            ]
+        );
+
+        const [updatedRows] = await connection.execute(
+            `
+            SELECT
+                user_id,
+                full_name,
+                email,
+                phone_number,
+                default_shipping_address,
+                status,
+                created_at,
+                updated_at
+            FROM users
+            WHERE user_id = ?
+            `,
+            [userId]
+        );
+
+        return res.json({
+            message: "Admin đã cập nhật user thành công!",
+            user: updatedRows[0]
+        });
+
+    } catch (error) {
+        console.error("Lỗi admin sửa user:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Email này đã tồn tại trong database!"
+            });
+        }
+
+        if (error.code === "AliasExistsException") {
+            return res.status(400).json({
+                error: "Email hoặc số điện thoại đã được dùng bởi tài khoản Cognito khác!"
+            });
+        }
+
+        return res.status(500).json({
+            error: error.message || "Không thể sửa user!"
+        });
+
+    } finally {
+        if (connection) connection.release();
+    }
+});
+// ==========================================
+// ADMIN ROUTE 4: XÓA USER
+// ==========================================
+app.delete('/api/admin/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+    const { userId } = req.params;
+
+    if (userId === req.user.sub) {
+        return res.status(400).json({
+            error: "Admin không thể tự xóa chính mình!"
+        });
+    }
+
+    let connection;
+
+    try {
+        connection = await dbPool.getConnection();
+
+        const [rows] = await connection.execute(
+            `
+            SELECT user_id, email
+            FROM users
+            WHERE user_id = ?
+            `,
+            [userId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy user cần xóa!"
+            });
+        }
+
+        const targetUser = rows[0];
+
+        await cognito.adminDeleteUser({
+            UserPoolId: process.env.COGNITO_USER_POOL_ID,
+            Username: targetUser.email
+        }).promise();
+
+        await connection.execute(
+            `
+            DELETE FROM users
+            WHERE user_id = ?
+            `,
+            [userId]
+        );
+
+        return res.json({
+            message: "Admin đã xóa user thành công!"
+        });
+
+    } catch (error) {
+        console.error("Lỗi admin xóa user:", error);
+        return res.status(500).json({
+            error: error.message || "Không thể xóa user!"
+        });
+
+    } finally {
+        if (connection) connection.release();
+    }
+});
 // Khởi chạy server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
