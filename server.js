@@ -36,6 +36,45 @@ function generateSecretHash(username) {
         .digest('base64');
 }
 
+function isValidEmail(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+async function authMiddleware(req, res, next) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({
+            error: "Không tìm thấy Token. Vui lòng đăng nhập!"
+        });
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    try {
+        const payload = await verifier.verify(token);
+
+        req.user = {
+            sub: payload.sub,
+            username: payload.username || payload["cognito:username"] || payload.sub,
+            accessToken: token,
+            payload
+        };
+
+        next();
+    } catch (error) {
+        console.error("Lỗi verify token:", error);
+        return res.status(401).json({
+            error: "Token không hợp lệ hoặc đã hết hạn!"
+        });
+    }
+}
+
+function getAttributeValue(attributes, name) {
+    const found = attributes.find(attr => attr.Name === name);
+    return found ? found.Value : null;
+}
+
 // ==========================================
 // ROUTE 1: ĐĂNG KÝ (SIGN UP)
 // ==========================================
@@ -160,27 +199,30 @@ app.post('/api/auth/login', async (req, res) => {
 // ==========================================
 // ROUTE 4: LẤY PROFILE (CẦN ĐĂNG NHẬP)
 // ==========================================
-app.get('/api/user/profile', async (req, res) => {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: "Không tìm thấy Token. Vui lòng đăng nhập!" });
-    }
-
-    const token = authHeader.split(' ')[1];
-
+app.get('/api/user/profile', authMiddleware, async (req, res) => {
     try {
-        const payload = await verifier.verify(token);
-
-        const userId = payload.sub;
+        const userId = req.user.sub;
 
         const [rows] = await dbPool.execute(
-            'SELECT user_id, full_name, email, phone_number, default_shipping_address FROM users WHERE user_id = ?',
+            `
+            SELECT 
+                user_id,
+                full_name,
+                email,
+                phone_number,
+                default_shipping_address,
+                created_at,
+                updated_at
+            FROM users
+            WHERE user_id = ?
+            `,
             [userId]
         );
 
         if (rows.length === 0) {
-            return res.status(404).json({ error: "Không tìm thấy profile của người dùng trong DB!" });
+            return res.status(404).json({
+                error: "Không tìm thấy profile của người dùng trong DB!"
+            });
         }
 
         return res.json({
@@ -189,8 +231,302 @@ app.get('/api/user/profile', async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Lỗi verify token hoặc lấy profile:", error);
-        return res.status(401).json({ error: "Token không hợp lệ hoặc đã hết hạn!" });
+        console.error("Lỗi lấy profile:", error);
+        return res.status(500).json({
+            error: "Lỗi hệ thống!"
+        });
+    }
+});
+// ==========================================
+// ROUTE 5: CẬP NHẬT PROFILE (CẦN ĐĂNG NHẬP)
+// ==========================================
+app.put('/api/user/profile', authMiddleware, async (req, res) => {
+    const {
+        fullName,
+        email,
+        phoneNumber,
+        defaultShippingAddress
+    } = req.body || {};
+
+    const userId = req.user.sub;
+    const cognitoUsername = req.user.username;
+
+    let connection;
+
+    try {
+        connection = await dbPool.getConnection();
+
+        const [rows] = await connection.execute(
+            `
+            SELECT 
+                user_id,
+                full_name,
+                email,
+                phone_number,
+                default_shipping_address
+            FROM users
+            WHERE user_id = ?
+            `,
+            [userId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy profile để cập nhật!"
+            });
+        }
+
+        const currentProfile = rows[0];
+
+        const nextFullName =
+            fullName !== undefined ? fullName.trim() : currentProfile.full_name;
+
+        const requestedEmail =
+            email !== undefined ? email.trim() : currentProfile.email;
+
+        const nextPhoneNumber =
+            phoneNumber !== undefined ? phoneNumber.trim() : currentProfile.phone_number;
+
+        const nextAddress =
+            defaultShippingAddress !== undefined
+                ? defaultShippingAddress.trim()
+                : currentProfile.default_shipping_address;
+
+        if (!nextFullName) {
+            return res.status(400).json({
+                error: "Họ và tên không được để trống"
+            });
+        }
+        if (!nextPhoneNumber) {
+            return res.status(400).json({
+                error: "Số điện thoại không được để trống"
+            });
+        }
+        if (!requestedEmail || !isValidEmail(requestedEmail)) {
+            return res.status(400).json({
+                error: "Email không hợp lệ"
+            });
+        }
+
+        if (nextPhoneNumber && !nextPhoneNumber.startsWith('+')) {
+            return res.status(400).json({
+                error: "Số điện thoại cần dùng định dạng quốc tế, ví dụ +84901234567"
+            });
+        }
+
+        const emailChanged = requestedEmail !== currentProfile.email;
+        const phoneChanged = nextPhoneNumber !== currentProfile.phone_number;
+        const nameChanged = nextFullName !== currentProfile.full_name;
+
+        const cognitoAttributes = [];
+
+        if (nameChanged) {
+            cognitoAttributes.push({
+                Name: 'name',
+                Value: nextFullName
+            });
+        }
+
+        if (emailChanged) {
+            cognitoAttributes.push({
+                Name: 'email',
+                Value: requestedEmail
+            });
+
+            // Không set email_verified = true
+            // Để Cognito gửi mã xác minh email mới.
+        }
+
+        if (phoneChanged) {
+            cognitoAttributes.push(
+                {
+                    Name: 'phone_number',
+                    Value: nextPhoneNumber
+                },
+                {
+                    Name: 'phone_number_verified',
+                    Value: 'true'
+                }
+            );
+        }
+
+        if (cognitoAttributes.length > 0) {
+            await cognito.adminUpdateUserAttributes({
+                UserPoolId: process.env.COGNITO_USER_POOL_ID,
+                Username: cognitoUsername,
+                UserAttributes: cognitoAttributes
+            }).promise();
+        }
+
+        // Không update email trong DB nếu emailChanged.
+        // Email chỉ update vào DB sau khi user xác minh mã email.
+        await connection.execute(
+            `
+            UPDATE users
+            SET
+                full_name = ?,
+                phone_number = ?,
+                default_shipping_address = ?
+            WHERE user_id = ?
+            `,
+            [
+                nextFullName,
+                nextPhoneNumber || null,
+                nextAddress || null,
+                userId
+            ]
+        );
+
+        const [updatedRows] = await connection.execute(
+            `
+            SELECT 
+                user_id,
+                full_name,
+                email,
+                phone_number,
+                default_shipping_address,
+                created_at,
+                updated_at
+            FROM users
+            WHERE user_id = ?
+            `,
+            [userId]
+        );
+
+        return res.json({
+            message: emailChanged
+                ? "Profile đã cập nhật. Vui lòng kiểm tra email mới để lấy mã xác minh."
+                : "Cập nhật profile thành công!",
+            emailVerificationRequired: emailChanged,
+            pendingEmail: emailChanged ? requestedEmail : null,
+            profile: updatedRows[0]
+        });
+
+    } catch (error) {
+        console.error("Lỗi cập nhật profile:", error);
+
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({
+                error: "Email này đã tồn tại trong database!"
+            });
+        }
+
+        if (error.code === 'AliasExistsException') {
+            return res.status(400).json({
+                error: "Email hoặc số điện thoại này đã được dùng bởi tài khoản Cognito khác!"
+            });
+        }
+
+        return res.status(500).json({
+            error: error.message || "Không thể cập nhật profile!"
+        });
+
+    } finally {
+        if (connection) connection.release();
+    }
+});
+// ==========================================
+// ROUTE 6: XÁC MINH EMAIL MỚI (CẦN ĐĂNG NHẬP)
+// ==========================================
+app.post('/api/user/profile/verify-email', authMiddleware, async (req, res) => {
+    const { code } = req.body || {};
+    const userId = req.user.sub;
+    const accessToken = req.user.accessToken;
+
+    if (!code) {
+        return res.status(400).json({
+            error: "Vui lòng nhập mã xác minh email"
+        });
+    }
+
+    let connection;
+
+    try {
+        // Xác minh email mới trong Cognito bằng AccessToken của user hiện tại.
+        await cognito.verifyUserAttribute({
+            AccessToken: accessToken,
+            AttributeName: 'email',
+            Code: code
+        }).promise();
+
+        // Sau khi verify xong, lấy lại email mới từ Cognito.
+        const cognitoUser = await cognito.getUser({
+            AccessToken: accessToken
+        }).promise();
+
+        const verifiedEmail = getAttributeValue(cognitoUser.UserAttributes, 'email');
+
+        if (!verifiedEmail) {
+            return res.status(400).json({
+                error: "Không lấy được email đã xác minh từ Cognito!"
+            });
+        }
+
+        connection = await dbPool.getConnection();
+
+        await connection.execute(
+            `
+            UPDATE users
+            SET email = ?
+            WHERE user_id = ?
+            `,
+            [verifiedEmail, userId]
+        );
+
+        const [updatedRows] = await connection.execute(
+            `
+            SELECT 
+                user_id,
+                full_name,
+                email,
+                phone_number,
+                default_shipping_address,
+                created_at,
+                updated_at
+            FROM users
+            WHERE user_id = ?
+            `,
+            [userId]
+        );
+
+        return res.json({
+            message: "Xác minh email mới thành công!",
+            profile: updatedRows[0]
+        });
+
+    } catch (error) {
+        console.error("Lỗi xác minh email mới:", error);
+
+        if (error.code === 'CodeMismatchException') {
+            return res.status(400).json({
+                error: "Mã xác minh không đúng!"
+            });
+        }
+
+        if (error.code === 'ExpiredCodeException') {
+            return res.status(400).json({
+                error: "Mã xác minh đã hết hạn!"
+            });
+        }
+
+        if (error.code === 'AliasExistsException') {
+            return res.status(400).json({
+                error: "Email này đã được dùng bởi tài khoản khác!"
+            });
+        }
+
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({
+                error: "Email này đã tồn tại trong database!"
+            });
+        }
+
+        return res.status(500).json({
+            error: error.message || "Không thể xác minh email mới!"
+        });
+
+    } finally {
+        if (connection) connection.release();
     }
 });
 
