@@ -114,7 +114,7 @@ async function removeUserFromGroup(username, groupName) {
 // ==========================================
 // ROUTE 1: ĐĂNG KÝ (SIGN UP)
 // ==========================================
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/users/auth/register', async (req, res) => {
     const { fullName, email, phoneNumber, password } = req.body;
 
     if (!fullName || !email || !phoneNumber || !password) {
@@ -164,7 +164,7 @@ app.post('/api/auth/register', async (req, res) => {
 // ==========================================
 // ROUTE 2: XÁC NHẬN ĐĂNG KÝ (CONFIRM SIGN UP)
 // ==========================================
-app.post('/api/auth/confirm-register', async (req, res) => {
+app.post('/api/users/auth/confirm-register', async (req, res) => {
     const { email, code } = req.body;
 
     if (!email || !code) {
@@ -198,7 +198,7 @@ app.post('/api/auth/confirm-register', async (req, res) => {
 // ==========================================
 // ROUTE 3: ĐĂNG NHẬP (SIGN IN)
 // ==========================================
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/users/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
@@ -235,7 +235,7 @@ app.post('/api/auth/login', async (req, res) => {
 // ==========================================
 // ROUTE 4: LẤY PROFILE (CẦN ĐĂNG NHẬP)
 // ==========================================
-app.get('/api/user/profile', authMiddleware, async (req, res) => {
+app.get('/api/users/me', authMiddleware, async (req, res) => {
     try {
         const userId = req.user.sub;
 
@@ -276,7 +276,7 @@ app.get('/api/user/profile', authMiddleware, async (req, res) => {
 // ==========================================
 // ROUTE 5: CẬP NHẬT PROFILE (CẦN ĐĂNG NHẬP)
 // ==========================================
-app.put('/api/user/profile', authMiddleware, async (req, res) => {
+app.put('/api/users/me', authMiddleware, async (req, res) => {
     const {
         fullName,
         email,
@@ -464,7 +464,7 @@ app.put('/api/user/profile', authMiddleware, async (req, res) => {
 // ==========================================
 // ROUTE 6: XÁC MINH EMAIL MỚI (CẦN ĐĂNG NHẬP)
 // ==========================================
-app.post('/api/user/profile/verify-email', authMiddleware, async (req, res) => {
+app.post('/api/users/me/verify-email', authMiddleware, async (req, res) => {
     const { code } = req.body || {};
     const userId = req.user.sub;
     const accessToken = req.user.accessToken;
@@ -569,7 +569,7 @@ app.post('/api/user/profile/verify-email', authMiddleware, async (req, res) => {
 // ==========================================
 // ADMIN ROUTE 1: LẤY DANH SÁCH USERS
 // ==========================================
-app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
+app.get('/api/users', authMiddleware, adminMiddleware, async (req, res) => {
     try {
         const [rows] = await dbPool.execute(
             `
@@ -602,7 +602,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
 // ==========================================
 // ADMIN ROUTE 2: TẠO USER MỚI
 // ==========================================
-app.post('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
+app.post('/api/users', authMiddleware, adminMiddleware, async (req, res) => {
     const {
         fullName,
         email,
@@ -733,7 +733,7 @@ app.post('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =
 // ==========================================
 // ADMIN ROUTE 3: SỬA USER
 // ==========================================
-app.put('/api/admin/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+app.put('/api/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
     const { userId } = req.params;
 
     const {
@@ -930,7 +930,7 @@ app.put('/api/admin/users/:userId', authMiddleware, adminMiddleware, async (req,
 // ==========================================
 // ADMIN ROUTE 4: XÓA USER
 // ==========================================
-app.delete('/api/admin/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+app.delete('/api/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
     const { userId } = req.params;
 
     if (userId === req.user.sub) {
