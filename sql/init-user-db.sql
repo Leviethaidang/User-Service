@@ -1,0 +1,13 @@
+CREATE DATABASE IF NOT EXISTS ecommerce_user_db;
+USE ecommerce_user_db;
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id VARCHAR(128) NOT NULL PRIMARY KEY,
+    full_name VARCHAR(100),
+    email VARCHAR(100) NOT NULL UNIQUE,
+    phone_number VARCHAR(20),
+    default_shipping_address TEXT,
+    status VARCHAR(30) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
